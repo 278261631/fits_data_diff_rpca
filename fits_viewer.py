@@ -30,7 +30,7 @@ MAX_ZOOM = 30.0
 ZOOM_STEP = 1.15
 
 
-def fits_to_qimage(file_path: Path) -> QImage:
+def _read_fits_2d(file_path: Path) -> np.ndarray:
     with fits.open(file_path, memmap=False) as hdul:
         data = hdul[0].data
 
@@ -42,10 +42,13 @@ def fits_to_qimage(file_path: Path) -> QImage:
         data = data[0]
     if data.ndim != 2:
         raise ValueError(f"{file_path.name} 不是二维图像")
+    return data
 
+
+def _normalize_to_uint8(data: np.ndarray) -> np.ndarray:
     finite = np.isfinite(data)
     if not finite.any():
-        raise ValueError(f"{file_path.name} 全部是无效数值")
+        raise ValueError("图像全部是无效数值")
 
     valid = data[finite]
     p1, p99 = np.percentile(valid, [1, 99])
@@ -58,11 +61,78 @@ def fits_to_qimage(file_path: Path) -> QImage:
     clipped = np.clip(data, p1, p99)
     norm = ((clipped - p1) / (p99 - p1) * 255.0).astype(np.uint8)
     norm[~finite] = 0
+    return norm
 
-    h, w = norm.shape
-    bytes_per_line = w
-    qimg = QImage(norm.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+
+def _gray_to_qimage(gray: np.ndarray) -> QImage:
+    h, w = gray.shape
+    qimg = QImage(gray.data, w, h, w, QImage.Format_Grayscale8)
     return qimg.copy()
+
+
+def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
+    h, w, _ = rgb.shape
+    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+    return qimg.copy()
+
+
+def fits_to_qimage(file_path: Path) -> tuple[QImage, np.ndarray]:
+    data = _read_fits_2d(file_path)
+    norm = _normalize_to_uint8(data)
+    return _gray_to_qimage(norm), data
+
+
+def rpca_decompose(matrix: np.ndarray, max_iter: int = 80, tol: float = 1e-6):
+    lam = 1.0 / np.sqrt(max(matrix.shape))
+    norm2 = np.linalg.norm(matrix, ord=2)
+    norm_inf = np.linalg.norm(matrix.ravel(), ord=np.inf) / lam
+    dual_norm = max(norm2, norm_inf)
+    if dual_norm == 0:
+        return np.zeros_like(matrix), np.zeros_like(matrix)
+
+    y = matrix / dual_norm
+    mu = 1.25 / (norm2 + 1e-12)
+    mu_bar = mu * 1e7
+    rho = 1.5
+
+    l = np.zeros_like(matrix)
+    s = np.zeros_like(matrix)
+    matrix_norm = np.linalg.norm(matrix, ord="fro") + 1e-12
+
+    for _ in range(max_iter):
+        u, sigma, vt = np.linalg.svd(matrix - s + (1.0 / mu) * y, full_matrices=False)
+        sigma_thresh = np.maximum(sigma - 1.0 / mu, 0.0)
+        rank = int(np.sum(sigma_thresh > 0))
+        if rank > 0:
+            l = (u[:, :rank] * sigma_thresh[:rank]) @ vt[:rank, :]
+        else:
+            l.fill(0.0)
+
+        residual = matrix - l + (1.0 / mu) * y
+        s = np.sign(residual) * np.maximum(np.abs(residual) - lam / mu, 0.0)
+
+        z = matrix - l - s
+        y = y + mu * z
+        mu = min(mu * rho, mu_bar)
+        if np.linalg.norm(z, ord="fro") / matrix_norm < tol:
+            break
+    return l, s
+
+
+def build_annotation_image(source: np.ndarray, sparse: np.ndarray, threshold: float) -> QImage:
+    base = _normalize_to_uint8(source)
+    rgb = np.stack([base, base, base], axis=2).astype(np.float32)
+
+    change_mask = np.abs(sparse) > threshold
+    bg_mask = ~change_mask
+
+    # 背景区域加轻微绿色，变化区域标红，方便快速检查时序变化。
+    rgb[bg_mask, 1] = np.clip(rgb[bg_mask, 1] * 0.75 + 45.0, 0, 255)
+    rgb[change_mask, 0] = 255
+    rgb[change_mask, 1] *= 0.25
+    rgb[change_mask, 2] *= 0.15
+
+    return _rgb_to_qimage(rgb.astype(np.uint8))
 
 
 class ImageView(QGraphicsView):
@@ -108,6 +178,8 @@ class MainWindow(QMainWindow):
 
         self._zoom = 1.0
         self._images = []
+        self._rpca_annotated = []
+        self._is_rpca_view = False
 
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self._on_current_row_changed)
@@ -120,6 +192,8 @@ class MainWindow(QMainWindow):
 
         open_btn = QPushButton("打开文件")
         open_btn.clicked.connect(self._open_files_dialog)
+        rpca_btn = QPushButton("RPCA标注")
+        rpca_btn.clicked.connect(self._run_rpca_annotation)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -131,6 +205,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(open_btn, 0)
+        left_layout.addWidget(rpca_btn, 0)
         left_layout.addWidget(self.list_widget, 1)
 
         splitter = QSplitter()
@@ -187,9 +262,10 @@ class MainWindow(QMainWindow):
     def _refresh_info_label(self):
         count = len(self._images)
         current = self.list_widget.currentRow() + 1 if count else 0
+        view_mode = "RPCA标注" if self._is_rpca_view else "原图"
         self.info_label.setText(
             f"图像: {current}/{count}    缩放: {self._zoom * 100:.1f}%    "
-            "快捷键: Tab/Shift+Tab 切换, Ctrl+加减号缩放"
+            f"模式: {view_mode}    快捷键: Tab/Shift+Tab 切换, Ctrl+加减号缩放"
         )
 
     def dragEnterEvent(self, event):
@@ -230,16 +306,18 @@ class MainWindow(QMainWindow):
 
         self.list_widget.clear()
         self._images.clear()
+        self._rpca_annotated.clear()
+        self._is_rpca_view = False
 
         failed = []
         for path in fits_files:
             try:
-                qimg = fits_to_qimage(path)
+                qimg, data = fits_to_qimage(path)
             except Exception as exc:
                 failed.append(f"{path.name}: {exc}")
                 continue
 
-            self._images.append((path, qimg))
+            self._images.append((path, qimg, data))
             item = QListWidgetItem(path.name)
             item.setToolTip(str(path))
             self.list_widget.addItem(item)
@@ -260,8 +338,14 @@ class MainWindow(QMainWindow):
     def _on_current_row_changed(self, row: int):
         if row < 0 or row >= len(self._images):
             return
-        _, qimg = self._images[row]
-        self.view.set_image(qimg)
+
+        _, qimg, _ = self._images[row]
+        if self._is_rpca_view and row < len(self._rpca_annotated):
+            self.view.set_image(self._rpca_annotated[row])
+        else:
+            self.view.set_image(qimg)
+            self._is_rpca_view = False
+
         self.view.set_zoom(self._zoom)
         self._refresh_info_label()
 
@@ -278,6 +362,61 @@ class MainWindow(QMainWindow):
             return
         current = self.list_widget.currentRow()
         self.list_widget.setCurrentRow((current - 1 + count) % count)
+
+    def _run_rpca_annotation(self):
+        if len(self._images) < 2:
+            QMessageBox.information(self, "提示", "至少需要 2 张 FITS 图像才能做 RPCA 标注")
+            return
+
+        h, w = self._images[0][2].shape
+        for path, _, data in self._images:
+            if data.shape != (h, w):
+                QMessageBox.warning(
+                    self,
+                    "尺寸不一致",
+                    f"{path.name} 尺寸与首张不同，无法执行 RPCA（需要所有图像同尺寸）",
+                )
+                return
+
+        stack = []
+        for _, _, data in self._images:
+            frame = np.array(data, dtype=np.float32, copy=True)
+            finite = np.isfinite(frame)
+            if finite.any():
+                med = float(np.median(frame[finite]))
+                frame[~finite] = med
+            else:
+                frame.fill(0.0)
+            stack.append(frame)
+
+        matrix = np.stack([x.reshape(-1) for x in stack], axis=1)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            _, sparse = rpca_decompose(matrix)
+        except Exception as exc:
+            QMessageBox.critical(self, "RPCA失败", f"RPCA 计算失败: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        sparse_abs = np.abs(sparse)
+        med = float(np.median(sparse_abs))
+        mad = float(np.median(np.abs(sparse_abs - med)))
+        threshold = med + 4.5 * (mad + 1e-8)
+        if threshold <= 0:
+            threshold = float(np.percentile(sparse_abs, 95))
+
+        self._rpca_annotated = []
+        for idx, (_, _, data) in enumerate(self._images):
+            sparse_i = sparse[:, idx].reshape(h, w)
+            annotated = build_annotation_image(data, sparse_i, threshold)
+            self._rpca_annotated.append(annotated)
+
+        self._is_rpca_view = True
+        current = self.list_widget.currentRow()
+        if current >= 0:
+            self._on_current_row_changed(current)
+        QMessageBox.information(self, "完成", "RPCA 标注已完成：红色为变化区域，绿色增强为背景区域")
 
 
 def main():
