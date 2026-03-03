@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -467,6 +468,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated = []
         self._rpca_mask_diff = []
         self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_multiplied_data = []
         self._is_rpca_view = False
         self._rpca_show_mask_diff = False
         self._rpca_show_mask_diff_multiplied = False
@@ -494,6 +496,8 @@ class MainWindow(QMainWindow):
         self.rpca_view_toggle_btn.clicked.connect(self._toggle_rpca_view_mode)
         self.rpca_mask_mul_btn = QPushButton("显示: mask减图×原图")
         self.rpca_mask_mul_btn.clicked.connect(self._toggle_rpca_mask_mul_view)
+        self.rpca_mask_mul_save_btn = QPushButton("保存: mask减图×原图")
+        self.rpca_mask_mul_save_btn.clicked.connect(self._save_mask_diff_multiplied_images)
         point_change_btn = QPushButton("点源对齐检测")
         point_change_btn.clicked.connect(self._run_point_source_change_detection)
         self.auto_threshold_checkbox = QCheckBox("自动阈值")
@@ -519,6 +523,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(fixed_bg_rpca_btn, 0)
         left_layout.addWidget(self.rpca_view_toggle_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_btn, 0)
+        left_layout.addWidget(self.rpca_mask_mul_save_btn, 0)
         left_layout.addWidget(point_change_btn, 0)
         left_layout.addWidget(self.auto_threshold_checkbox, 0)
         left_layout.addWidget(self.threshold_hint_label, 0)
@@ -623,6 +628,50 @@ class MainWindow(QMainWindow):
         text = "显示: 原始红绿mask" if self._rpca_show_mask_diff_multiplied else "显示: mask减图×原图"
         self.rpca_mask_mul_btn.setText(text)
 
+    def _save_mask_diff_multiplied_images(self):
+        if self._rpca_sparse is None or not self._rpca_mask_diff_multiplied_data:
+            QMessageBox.information(self, "提示", "请先执行 RPCA 标注，生成 mask减图×原图 后再保存")
+            return
+
+        date_tag = datetime.now().strftime("%Y%m%d")
+        out_dir_name = f"mask_diff_{date_tag}"
+        saved_files = []
+        failed = []
+
+        for idx, (path, _, _) in enumerate(self._images):
+            if idx >= len(self._rpca_mask_diff_multiplied_data):
+                break
+            out_dir = path.parent / out_dir_name
+            out_path = out_dir / f"{path.stem}_mask_diff.fits"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                fits.writeto(
+                    out_path,
+                    self._rpca_mask_diff_multiplied_data[idx].astype(np.float32),
+                    overwrite=True,
+                )
+                saved_files.append(out_path)
+            except Exception as exc:
+                failed.append(f"{path.name}: {exc}")
+
+        if saved_files and not failed:
+            QMessageBox.information(
+                self,
+                "保存完成",
+                f"已保存 {len(saved_files)} 个文件到各自目录下的 {out_dir_name} 文件夹。",
+            )
+            return
+
+        if saved_files and failed:
+            QMessageBox.warning(
+                self,
+                "部分保存失败",
+                f"成功保存 {len(saved_files)} 个文件。\n失败 {len(failed)} 个：\n" + "\n".join(failed[:12]),
+            )
+            return
+
+        QMessageBox.critical(self, "保存失败", "未成功保存任何文件。\n" + "\n".join(failed[:12]))
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -664,6 +713,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated.clear()
         self._rpca_mask_diff.clear()
         self._rpca_mask_diff_multiplied.clear()
+        self._rpca_mask_diff_multiplied_data.clear()
         self._is_rpca_view = False
         self._rpca_show_mask_diff = False
         self._rpca_show_mask_diff_multiplied = False
@@ -925,6 +975,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated = annotated_images
         self._rpca_mask_diff = []
         self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_multiplied_data = []
         self._rpca_show_mask_diff = False
         self._rpca_show_mask_diff_multiplied = False
         self._update_rpca_view_toggle_text()
@@ -965,6 +1016,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated = []
         self._rpca_mask_diff = []
         self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_multiplied_data = []
         h, w = self._images[0][2].shape
         for idx, (_, _, data) in enumerate(self._images):
             sparse_i = self._rpca_sparse[:, idx].reshape(h, w)
@@ -982,6 +1034,11 @@ class MainWindow(QMainWindow):
                 data, sparse_i, prev_sparse_i, self._rpca_threshold
             )
             self._rpca_mask_diff_multiplied.append(mask_diff_multiplied)
+            curr_mask = np.abs(sparse_i) > self._rpca_threshold
+            prev_mask = np.abs(prev_sparse_i) > self._rpca_threshold
+            diff_mask = curr_mask ^ prev_mask
+            multiplied_data = _sanitize_frame(data) * diff_mask.astype(np.float32)
+            self._rpca_mask_diff_multiplied_data.append(multiplied_data)
 
     def _on_threshold_mode_changed(self):
         self._update_threshold_hint_label()
