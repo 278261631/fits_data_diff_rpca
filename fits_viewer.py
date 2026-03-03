@@ -417,27 +417,24 @@ class ImageView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
 
     def set_image(self, image: QImage) -> None:
-        old_rect = self.sceneRect()
-        old_center = self.mapToScene(self.viewport().rect().center())
-        keep_relative_center = old_rect.isValid() and old_rect.width() > 0 and old_rect.height() > 0
-        rel_x = 0.5
-        rel_y = 0.5
-        if keep_relative_center:
-            rel_x = (old_center.x() - old_rect.left()) / old_rect.width()
-            rel_y = (old_center.y() - old_rect.top()) / old_rect.height()
+        hbar = self.horizontalScrollBar()
+        vbar = self.verticalScrollBar()
+        old_h = hbar.value()
+        old_v = vbar.value()
+        had_content = self._pixmap_item.pixmap().width() > 0 and self._pixmap_item.pixmap().height() > 0
 
         self._pixmap_item.setPixmap(QPixmap.fromImage(image))
         new_rect = self._pixmap_item.boundingRect()
         self.scene().setSceneRect(new_rect)
-        self.set_zoom(self._zoom)
-        if keep_relative_center and new_rect.width() > 0 and new_rect.height() > 0:
-            rel_x = min(max(rel_x, 0.0), 1.0)
-            rel_y = min(max(rel_y, 0.0), 1.0)
-            target = QPointF(
-                new_rect.left() + rel_x * new_rect.width(),
-                new_rect.top() + rel_y * new_rect.height(),
-            )
-            self.centerOn(target)
+
+        if not new_rect.isValid() or new_rect.width() <= 0 or new_rect.height() <= 0:
+            self.centerOn(new_rect.center())
+            return
+
+        # 在同尺寸图像间切换时直接恢复滚动条，避免 centerOn 的像素取整累计漂移。
+        if had_content:
+            hbar.setValue(min(max(old_h, hbar.minimum()), hbar.maximum()))
+            vbar.setValue(min(max(old_v, vbar.minimum()), vbar.maximum()))
         else:
             self.centerOn(new_rect.center())
 
