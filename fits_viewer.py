@@ -465,6 +465,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated = []
         self._rpca_mask_diff = []
         self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_data = []
         self._rpca_mask_diff_multiplied_data = []
         self._is_rpca_view = False
         self._rpca_show_mask_diff = False
@@ -626,7 +627,11 @@ class MainWindow(QMainWindow):
         self.rpca_mask_mul_btn.setText(text)
 
     def _save_mask_diff_multiplied_images(self):
-        if self._rpca_sparse is None or not self._rpca_mask_diff_multiplied_data:
+        if (
+            self._rpca_sparse is None
+            or not self._rpca_mask_diff_multiplied_data
+            or not self._rpca_mask_diff_data
+        ):
             QMessageBox.information(self, "提示", "请先执行 RPCA 标注，生成 mask减图×原图 后再保存")
             return
 
@@ -636,18 +641,37 @@ class MainWindow(QMainWindow):
         failed = []
 
         for idx, (path, _, _) in enumerate(self._images):
-            if idx >= len(self._rpca_mask_diff_multiplied_data):
+            if idx >= len(self._rpca_mask_diff_multiplied_data) or idx >= len(self._rpca_mask_diff_data):
                 break
             out_dir = path.parent / out_dir_name
-            out_path = out_dir / f"{path.stem}_mask_diff.fits"
+            out_mul_path = out_dir / f"{path.stem}_mask_diff_mul.fits"
+            out_mask_path = out_dir / f"{path.stem}_mask_diff.png"
+            out_mask_rb_path = out_dir / f"{path.stem}_mask_diff_rb.png"
             try:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 fits.writeto(
-                    out_path,
+                    out_mul_path,
                     self._rpca_mask_diff_multiplied_data[idx].astype(np.float32),
                     overwrite=True,
                 )
-                saved_files.append(out_path)
+
+                diff_mask_data = self._rpca_mask_diff_data[idx]
+                diff_mask = diff_mask_data != 0
+                mask_gray = np.zeros(diff_mask.shape, dtype=np.uint8)
+                mask_gray[diff_mask] = 255
+                _gray_to_qimage(mask_gray).save(str(out_mask_path), "PNG")
+
+                # 红蓝mask减图: 红=新增(1), 蓝=消失(-1), 黑=无变化(0)。
+                rgb = np.zeros((diff_mask_data.shape[0], diff_mask_data.shape[1], 3), dtype=np.uint8)
+                added = diff_mask_data > 0
+                removed = diff_mask_data < 0
+                rgb[added, 0] = 255
+                rgb[removed, 2] = 255
+                _rgb_to_qimage(rgb).save(str(out_mask_rb_path), "PNG")
+
+                saved_files.append(out_mul_path)
+                saved_files.append(out_mask_path)
+                saved_files.append(out_mask_rb_path)
             except Exception as exc:
                 failed.append(f"{path.name}: {exc}")
 
@@ -710,6 +734,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated.clear()
         self._rpca_mask_diff.clear()
         self._rpca_mask_diff_multiplied.clear()
+        self._rpca_mask_diff_data.clear()
         self._rpca_mask_diff_multiplied_data.clear()
         self._is_rpca_view = False
         self._rpca_show_mask_diff = False
@@ -971,6 +996,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated = annotated_images
         self._rpca_mask_diff = []
         self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_data = []
         self._rpca_mask_diff_multiplied_data = []
         self._rpca_show_mask_diff = False
         self._rpca_show_mask_diff_multiplied = False
@@ -1012,6 +1038,7 @@ class MainWindow(QMainWindow):
         self._rpca_annotated = []
         self._rpca_mask_diff = []
         self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_data = []
         self._rpca_mask_diff_multiplied_data = []
         h, w = self._images[0][2].shape
         for idx, (_, _, data) in enumerate(self._images):
@@ -1033,7 +1060,9 @@ class MainWindow(QMainWindow):
             curr_mask = np.abs(sparse_i) > self._rpca_threshold
             prev_mask = np.abs(prev_sparse_i) > self._rpca_threshold
             diff_mask = curr_mask ^ prev_mask
+            diff_mask_data = curr_mask.astype(np.float32) - prev_mask.astype(np.float32)
             multiplied_data = _sanitize_frame(data) * diff_mask.astype(np.float32)
+            self._rpca_mask_diff_data.append(diff_mask_data)
             self._rpca_mask_diff_multiplied_data.append(multiplied_data)
 
     def _on_threshold_mode_changed(self):
