@@ -1,4 +1,7 @@
 import sys
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -474,6 +477,7 @@ class MainWindow(QMainWindow):
         self._rpca_sparse = None
         self._rpca_abs = None
         self._rpca_threshold = None
+        self._hotpants_tempdir = None
 
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self._on_current_row_changed)
@@ -490,6 +494,8 @@ class MainWindow(QMainWindow):
         rpca_btn.clicked.connect(self._run_rpca_annotation)
         fixed_bg_rpca_btn = QPushButton("固定背景RPCA")
         fixed_bg_rpca_btn.clicked.connect(self._run_fixed_background_rpca)
+        hotpants_btn = QPushButton("Hotpants减图")
+        hotpants_btn.clicked.connect(self._run_hotpants_subtraction)
         self.rpca_view_toggle_btn = QPushButton("显示: 原始红绿mask")
         self.rpca_view_toggle_btn.clicked.connect(self._toggle_rpca_view_mode)
         self.rpca_mask_mul_btn = QPushButton("显示: mask减图×原图")
@@ -519,6 +525,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(open_btn, 0)
         left_layout.addWidget(rpca_btn, 0)
         left_layout.addWidget(fixed_bg_rpca_btn, 0)
+        left_layout.addWidget(hotpants_btn, 0)
         left_layout.addWidget(self.rpca_view_toggle_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_save_btn, 0)
@@ -693,6 +700,122 @@ class MainWindow(QMainWindow):
 
         QMessageBox.critical(self, "保存失败", "未成功保存任何文件。\n" + "\n".join(failed[:12]))
 
+    def _find_hotpants_executable(self) -> str | None:
+        # 允许通过环境变量显式指定可执行文件路径。
+        from os import environ
+
+        custom = environ.get("HOTPANTS_PATH", "").strip()
+        if custom:
+            candidate = Path(custom)
+            if candidate.exists():
+                return str(candidate)
+            if shutil.which(custom):
+                return custom
+
+        for name in ("hotpants", "hotpants.exe"):
+            found = shutil.which(name)
+            if found:
+                return found
+        return None
+
+    def _cleanup_hotpants_tempdir(self):
+        if self._hotpants_tempdir is not None:
+            try:
+                self._hotpants_tempdir.cleanup()
+            except Exception:
+                pass
+            self._hotpants_tempdir = None
+
+    def _run_hotpants_subtraction(self):
+        if len(self._images) < 2:
+            QMessageBox.information(self, "提示", "至少需要 2 张 FITS 图像才能做 Hotpants 减图")
+            return
+
+        hotpants_exe = self._find_hotpants_executable()
+        if not hotpants_exe:
+            QMessageBox.warning(
+                self,
+                "未找到 hotpants",
+                "未在 PATH 中找到 hotpants。\n"
+                "请先安装并配置可执行文件，或设置环境变量 HOTPANTS_PATH。",
+            )
+            return
+
+        self._cleanup_hotpants_tempdir()
+        self._hotpants_tempdir = tempfile.TemporaryDirectory(prefix="hotpants_diff_")
+        temp_root = Path(self._hotpants_tempdir.name)
+
+        h, w = self._images[0][2].shape
+        annotated_images = []
+        failed = []
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for idx, (cur_path, _, cur_data) in enumerate(self._images):
+                if idx == 0:
+                    zero = np.zeros((h, w), dtype=np.uint8)
+                    annotated_images.append(_gray_to_qimage(zero))
+                    continue
+
+                prev_path = self._images[idx - 1][0]
+                out_path = temp_root / f"hotpants_diff_{idx:04d}.fits"
+
+                cmd = [
+                    hotpants_exe,
+                    "-inim",
+                    str(cur_path),
+                    "-tmplim",
+                    str(prev_path),
+                    "-outim",
+                    str(out_path),
+                    "-v",
+                    "0",
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0 or not out_path.exists():
+                    err = proc.stderr.strip() or proc.stdout.strip() or f"退出码 {proc.returncode}"
+                    failed.append(f"{cur_path.name}: {err}")
+                    # 失败时给占位图，避免中断整批浏览。
+                    annotated_images.append(_gray_to_qimage(np.zeros((h, w), dtype=np.uint8)))
+                    continue
+
+                try:
+                    diff_data = _read_fits_2d(out_path)
+                    diff_qimg = _gray_to_qimage(_normalize_to_uint8(diff_data))
+                    annotated_images.append(diff_qimg)
+                except Exception as exc:
+                    failed.append(f"{cur_path.name}: 读取结果失败: {exc}")
+                    annotated_images.append(_gray_to_qimage(np.zeros((h, w), dtype=np.uint8)))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._rpca_sparse = None
+        self._rpca_abs = None
+        self._rpca_threshold = None
+        self._rpca_annotated = annotated_images
+        self._rpca_mask_diff = []
+        self._rpca_mask_diff_multiplied = []
+        self._rpca_mask_diff_data = []
+        self._rpca_mask_diff_multiplied_data = []
+        self._rpca_show_mask_diff = False
+        self._rpca_show_mask_diff_multiplied = False
+        self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
+        self._is_rpca_view = True
+        self._annotation_mode_label = "Hotpants减图(当前-前一帧)"
+        current = self.list_widget.currentRow()
+        if current >= 0:
+            self._on_current_row_changed(current)
+
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Hotpants 部分失败",
+                f"已完成减图，但有 {len(failed)} 张失败：\n" + "\n".join(failed[:10]),
+            )
+        else:
+            QMessageBox.information(self, "完成", "Hotpants 减图完成（当前帧 - 前一帧）")
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -708,6 +831,7 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def load_files(self, paths):
+        self._cleanup_hotpants_tempdir()
         fits_files = []
         for p in paths:
             if p.is_file() and p.suffix.lower() in FITS_SUFFIXES:
