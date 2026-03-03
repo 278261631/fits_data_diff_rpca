@@ -137,6 +137,231 @@ def build_annotation_image(source: np.ndarray, sparse: np.ndarray, threshold: fl
     return _rgb_to_qimage(rgb.astype(np.uint8))
 
 
+def _sanitize_frame(data: np.ndarray) -> np.ndarray:
+    frame = np.array(data, dtype=np.float32, copy=True)
+    finite = np.isfinite(frame)
+    if finite.any():
+        med = float(np.median(frame[finite]))
+        frame[~finite] = med
+    else:
+        frame.fill(0.0)
+    return frame
+
+
+def detect_point_sources(data: np.ndarray, sensitivity: float) -> np.ndarray:
+    frame = _sanitize_frame(data)
+    med = float(np.median(frame))
+    mad = float(np.median(np.abs(frame - med)))
+    sigma = 1.4826 * mad + 1e-6
+    z = (frame - med) / sigma
+
+    # 灵敏度越高，阈值越低，检测点越多。
+    threshold = 6.0 - 4.5 * np.clip(sensitivity, 0.01, 1.0)
+    mask = z > threshold
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    points_with_score = []
+
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if not mask[y, x] or visited[y, x]:
+                continue
+
+            stack = [(y, x)]
+            visited[y, x] = True
+            pixels = []
+            while stack:
+                cy, cx = stack.pop()
+                pixels.append((cy, cx))
+                for ny in range(max(1, cy - 1), min(h - 1, cy + 2)):
+                    for nx in range(max(1, cx - 1), min(w - 1, cx + 2)):
+                        if mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+
+            # 每个连通域只保留一个代表点，使用几何质心法。
+            comp_scores = np.array([z[py, px] for py, px in pixels], dtype=np.float32)
+            best_idx = int(np.argmax(comp_scores))
+            ys = np.array([py for py, _ in pixels], dtype=np.float32)
+            xs = np.array([px for _, px in pixels], dtype=np.float32)
+            cx = float(np.mean(xs))
+            cy = float(np.mean(ys))
+
+            points_with_score.append((cx, cy, float(comp_scores[best_idx])))
+
+    if not points_with_score:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    points_with_score.sort(key=lambda t: t[2], reverse=True)
+    points = np.array([[p[0], p[1]] for p in points_with_score[:250]], dtype=np.float32)
+    return points
+
+
+def _score_translation(ref_points: np.ndarray, tgt_points: np.ndarray, shift: np.ndarray, radius: float) -> int:
+    if len(ref_points) == 0 or len(tgt_points) == 0:
+        return 0
+    aligned = tgt_points + shift[None, :]
+    diff = aligned[:, None, :] - ref_points[None, :, :]
+    d2 = np.sum(diff * diff, axis=2)
+    min_d2 = np.min(d2, axis=1)
+    return int(np.sum(min_d2 <= radius * radius))
+
+
+def estimate_translation(ref_points: np.ndarray, tgt_points: np.ndarray, radius: float = 3.0) -> np.ndarray:
+    if len(ref_points) == 0 or len(tgt_points) == 0:
+        return np.zeros(2, dtype=np.float32)
+
+    ref_small = ref_points[:80]
+    tgt_small = tgt_points[:80]
+    best_shift = np.zeros(2, dtype=np.float32)
+    best_score = -1
+    for rp in ref_small:
+        for tp in tgt_small:
+            shift = rp - tp
+            score = _score_translation(ref_points, tgt_points, shift, radius)
+            if score > best_score:
+                best_score = score
+                best_shift = shift
+    return best_shift.astype(np.float32)
+
+
+def match_points(
+    ref_points: np.ndarray, tgt_points: np.ndarray, shift: np.ndarray, radius: float = 3.0
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(ref_points) == 0 or len(tgt_points) == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+    aligned = tgt_points + shift[None, :]
+    diff = aligned[:, None, :] - ref_points[None, :, :]
+    d2 = np.sum(diff * diff, axis=2)
+
+    t_idx, r_idx = np.where(d2 <= radius * radius)
+    if len(t_idx) == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    order = np.argsort(d2[t_idx, r_idx])
+    used_t = set()
+    used_r = set()
+    matched_t = []
+    matched_r = []
+    for o in order:
+        ti = int(t_idx[o])
+        ri = int(r_idx[o])
+        if ti in used_t or ri in used_r:
+            continue
+        used_t.add(ti)
+        used_r.add(ri)
+        matched_t.append(ti)
+        matched_r.append(ri)
+    return np.array(matched_r, dtype=np.int32), np.array(matched_t, dtype=np.int32)
+
+
+def _draw_cross(rgb: np.ndarray, x: float, y: float, color: tuple[int, int, int], size: int = 3):
+    h, w, _ = rgb.shape
+    cx = int(round(x))
+    cy = int(round(y))
+    if cx < 0 or cy < 0 or cx >= w or cy >= h:
+        return
+    for d in range(-size, size + 1):
+        xx = cx + d
+        yy = cy + d
+        if 0 <= xx < w:
+            rgb[cy, xx, :] = color
+        if 0 <= yy < h:
+            rgb[yy, cx, :] = color
+
+
+def _cross(o: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+
+def _convex_hull(points: np.ndarray) -> np.ndarray:
+    if len(points) < 3:
+        return points
+    pts = np.unique(np.round(points).astype(np.int32), axis=0)
+    if len(pts) < 3:
+        return pts.astype(np.float32)
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    lower = []
+    for p in pts:
+        p = p.astype(np.float32)
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in reversed(pts):
+        p = p.astype(np.float32)
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = np.vstack([lower[:-1], upper[:-1]])
+    return hull.astype(np.float32)
+
+
+def _draw_line(rgb: np.ndarray, x0: float, y0: float, x1: float, y1: float, color: tuple[int, int, int]):
+    h, w, _ = rgb.shape
+    x0 = int(round(x0))
+    y0 = int(round(y0))
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+
+    dx = abs(x1 - x0)
+    sx = 1 if x0 < x1 else -1
+    dy = -abs(y1 - y0)
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+
+    while True:
+        if 0 <= x0 < w and 0 <= y0 < h:
+            rgb[y0, x0, :] = color
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def _draw_polygon(rgb: np.ndarray, points: np.ndarray, color: tuple[int, int, int]):
+    if len(points) < 3:
+        return
+    hull = _convex_hull(points)
+    if len(hull) < 3:
+        return
+    for i in range(len(hull)):
+        p0 = hull[i]
+        p1 = hull[(i + 1) % len(hull)]
+        _draw_line(rgb, p0[0], p0[1], p1[0], p1[1], color)
+
+
+def build_point_change_image(
+    source: np.ndarray,
+    matched_points: np.ndarray,
+    added_points: np.ndarray,
+    missing_points: np.ndarray,
+) -> QImage:
+    base = _normalize_to_uint8(source)
+    rgb = np.stack([base, base, base], axis=2)
+
+    # 绿=匹配点, 红=新增点, 蓝=消失点(在当前帧预测位置)。
+    for p in matched_points:
+        _draw_cross(rgb, p[0], p[1], (40, 220, 40), size=2)
+    for p in added_points:
+        _draw_cross(rgb, p[0], p[1], (255, 60, 60), size=3)
+    for p in missing_points:
+        _draw_cross(rgb, p[0], p[1], (80, 150, 255), size=3)
+    _draw_polygon(rgb, matched_points, (40, 220, 40))
+    _draw_polygon(rgb, added_points, (255, 60, 60))
+    _draw_polygon(rgb, missing_points, (80, 150, 255))
+
+    return _rgb_to_qimage(rgb.astype(np.uint8))
+
+
 class ImageView(QGraphicsView):
     zoom_changed = Signal(float)
 
@@ -222,6 +447,8 @@ class MainWindow(QMainWindow):
         rpca_btn.clicked.connect(self._run_rpca_annotation)
         fixed_bg_rpca_btn = QPushButton("固定背景RPCA")
         fixed_bg_rpca_btn.clicked.connect(self._run_fixed_background_rpca)
+        point_change_btn = QPushButton("点源对齐检测")
+        point_change_btn.clicked.connect(self._run_point_source_change_detection)
         self.auto_threshold_checkbox = QCheckBox("自动阈值")
         self.auto_threshold_checkbox.setChecked(True)
         self.auto_threshold_checkbox.toggled.connect(self._on_threshold_mode_changed)
@@ -243,6 +470,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(open_btn, 0)
         left_layout.addWidget(rpca_btn, 0)
         left_layout.addWidget(fixed_bg_rpca_btn, 0)
+        left_layout.addWidget(point_change_btn, 0)
         left_layout.addWidget(self.auto_threshold_checkbox, 0)
         left_layout.addWidget(self.threshold_hint_label, 0)
         left_layout.addWidget(self.threshold_slider, 0)
@@ -516,6 +744,92 @@ class MainWindow(QMainWindow):
             self,
             "完成",
             f"固定背景 RPCA 标注完成。\n参考背景: {ref_name}\n红色为相对参考的变化区域。",
+        )
+
+    def _run_point_source_change_detection(self):
+        if len(self._images) < 2:
+            QMessageBox.information(self, "提示", "至少需要 2 张 FITS 图像才能做点源对齐检测")
+            return
+
+        ref_idx = self.list_widget.currentRow()
+        if ref_idx < 0 or ref_idx >= len(self._images):
+            QMessageBox.information(self, "提示", "请先选中一张图作为参考图")
+            return
+
+        h, w = self._images[0][2].shape
+        for path, _, data in self._images:
+            if data.shape != (h, w):
+                QMessageBox.warning(
+                    self,
+                    "尺寸不一致",
+                    f"{path.name} 尺寸与首张不同，无法执行点源对齐检测（需要所有图像同尺寸）",
+                )
+                return
+
+        sensitivity = self.threshold_slider.value() / 100.0
+        match_radius = 3.0
+
+        frames = [_sanitize_frame(data) for _, _, data in self._images]
+        point_sets = [detect_point_sources(frame, sensitivity) for frame in frames]
+        ref_points = point_sets[ref_idx]
+        if len(ref_points) == 0:
+            QMessageBox.warning(self, "检测失败", "参考图未检测到有效点源，请提高灵敏度后重试")
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            annotated_images = []
+            for idx, frame in enumerate(frames):
+                tgt_points = point_sets[idx]
+                if len(tgt_points) == 0:
+                    missing_on_tgt = ref_points.copy()
+                    qimg = build_point_change_image(
+                        frame,
+                        matched_points=np.zeros((0, 2), dtype=np.float32),
+                        added_points=np.zeros((0, 2), dtype=np.float32),
+                        missing_points=missing_on_tgt,
+                    )
+                    annotated_images.append(qimg)
+                    continue
+
+                shift = estimate_translation(ref_points, tgt_points, radius=match_radius)
+                matched_ref, matched_tgt = match_points(
+                    ref_points, tgt_points, shift=shift, radius=match_radius
+                )
+
+                ref_mask = np.ones(len(ref_points), dtype=bool)
+                tgt_mask = np.ones(len(tgt_points), dtype=bool)
+                ref_mask[matched_ref] = False
+                tgt_mask[matched_tgt] = False
+
+                matched_points = tgt_points[matched_tgt] if len(matched_tgt) else np.zeros((0, 2), dtype=np.float32)
+                added_points = tgt_points[tgt_mask]
+                missing_points = ref_points[ref_mask] - shift[None, :]
+
+                qimg = build_point_change_image(
+                    frame,
+                    matched_points=matched_points,
+                    added_points=added_points,
+                    missing_points=missing_points,
+                )
+                annotated_images.append(qimg)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._rpca_sparse = None
+        self._rpca_abs = None
+        self._rpca_threshold = None
+        self._rpca_annotated = annotated_images
+        self._is_rpca_view = True
+        ref_name = self._images[ref_idx][0].name
+        self._annotation_mode_label = f"点源对齐检测(参考: {ref_name})"
+        current = self.list_widget.currentRow()
+        if current >= 0:
+            self._on_current_row_changed(current)
+        QMessageBox.information(
+            self,
+            "完成",
+            "点源对齐检测完成：绿色=匹配点，红色=新增点，蓝色=消失点。",
         )
 
     def _compute_current_threshold(self) -> float:
