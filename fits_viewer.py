@@ -828,7 +828,6 @@ class MainWindow(QMainWindow):
         current = self.list_widget.currentRow()
         if current >= 0:
             self._on_current_row_changed(current)
-        QMessageBox.information(self, "完成", "RPCA 标注已完成：红色为变化区域，绿色增强为背景区域")
 
     def _run_fixed_background_rpca(self):
         if len(self._images) < 2:
