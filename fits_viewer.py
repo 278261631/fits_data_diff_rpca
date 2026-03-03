@@ -202,6 +202,7 @@ class MainWindow(QMainWindow):
         self._images = []
         self._rpca_annotated = []
         self._is_rpca_view = False
+        self._annotation_mode_label = ""
         self._rpca_sparse = None
         self._rpca_abs = None
         self._rpca_threshold = None
@@ -219,6 +220,8 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self._open_files_dialog)
         rpca_btn = QPushButton("RPCA标注")
         rpca_btn.clicked.connect(self._run_rpca_annotation)
+        fixed_bg_rpca_btn = QPushButton("固定背景RPCA")
+        fixed_bg_rpca_btn.clicked.connect(self._run_fixed_background_rpca)
         self.auto_threshold_checkbox = QCheckBox("自动阈值")
         self.auto_threshold_checkbox.setChecked(True)
         self.auto_threshold_checkbox.toggled.connect(self._on_threshold_mode_changed)
@@ -239,6 +242,7 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(open_btn, 0)
         left_layout.addWidget(rpca_btn, 0)
+        left_layout.addWidget(fixed_bg_rpca_btn, 0)
         left_layout.addWidget(self.auto_threshold_checkbox, 0)
         left_layout.addWidget(self.threshold_hint_label, 0)
         left_layout.addWidget(self.threshold_slider, 0)
@@ -298,7 +302,7 @@ class MainWindow(QMainWindow):
     def _refresh_info_label(self):
         count = len(self._images)
         current = self.list_widget.currentRow() + 1 if count else 0
-        view_mode = "RPCA标注" if self._is_rpca_view else "原图"
+        view_mode = self._annotation_mode_label if self._is_rpca_view else "原图"
         threshold_text = ""
         if self._rpca_threshold is not None:
             threshold_text = f"    阈值: {self._rpca_threshold:.4g}"
@@ -347,6 +351,7 @@ class MainWindow(QMainWindow):
         self._images.clear()
         self._rpca_annotated.clear()
         self._is_rpca_view = False
+        self._annotation_mode_label = ""
         self._rpca_sparse = None
         self._rpca_abs = None
         self._rpca_threshold = None
@@ -445,10 +450,73 @@ class MainWindow(QMainWindow):
         self._rebuild_rpca_annotations()
 
         self._is_rpca_view = True
+        self._annotation_mode_label = "RPCA标注"
         current = self.list_widget.currentRow()
         if current >= 0:
             self._on_current_row_changed(current)
         QMessageBox.information(self, "完成", "RPCA 标注已完成：红色为变化区域，绿色增强为背景区域")
+
+    def _run_fixed_background_rpca(self):
+        if len(self._images) < 2:
+            QMessageBox.information(self, "提示", "至少需要 2 张 FITS 图像才能做固定背景 RPCA")
+            return
+
+        ref_idx = self.list_widget.currentRow()
+        if ref_idx < 0 or ref_idx >= len(self._images):
+            QMessageBox.information(self, "提示", "请先用 Tab 或鼠标选中一张图作为参考背景")
+            return
+
+        h, w = self._images[0][2].shape
+        for path, _, data in self._images:
+            if data.shape != (h, w):
+                QMessageBox.warning(
+                    self,
+                    "尺寸不一致",
+                    f"{path.name} 尺寸与首张不同，无法执行固定背景 RPCA（需要所有图像同尺寸）",
+                )
+                return
+
+        stack = []
+        for _, _, data in self._images:
+            frame = np.array(data, dtype=np.float32, copy=True)
+            finite = np.isfinite(frame)
+            if finite.any():
+                med = float(np.median(frame[finite]))
+                frame[~finite] = med
+            else:
+                frame.fill(0.0)
+            stack.append(frame)
+
+        matrix = np.stack([x.reshape(-1) for x in stack], axis=1)
+        reference_vec = matrix[:, [ref_idx]]
+        centered_matrix = matrix - reference_vec
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            _, sparse = rpca_decompose(centered_matrix)
+        except Exception as exc:
+            QMessageBox.critical(self, "固定背景RPCA失败", f"计算失败: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # 参考帧相对于自身的变化应为 0，抑制数值残差带来的误检。
+        sparse[:, ref_idx] = 0.0
+        self._rpca_sparse = sparse
+        self._rpca_abs = np.abs(sparse)
+        self._rebuild_rpca_annotations()
+
+        ref_name = self._images[ref_idx][0].name
+        self._is_rpca_view = True
+        self._annotation_mode_label = f"固定背景RPCA(参考: {ref_name})"
+        current = self.list_widget.currentRow()
+        if current >= 0:
+            self._on_current_row_changed(current)
+        QMessageBox.information(
+            self,
+            "完成",
+            f"固定背景 RPCA 标注完成。\n参考背景: {ref_name}\n红色为相对参考的变化区域。",
+        )
 
     def _compute_current_threshold(self) -> float:
         if self._rpca_abs is None:
