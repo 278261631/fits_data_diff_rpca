@@ -161,6 +161,21 @@ def build_mask_subtracted_image(
     return _rgb_to_qimage(rgb.astype(np.uint8))
 
 
+def build_mask_diff_multiplied_image(
+    source: np.ndarray, current_sparse: np.ndarray, previous_sparse: np.ndarray, threshold: float
+) -> QImage:
+    base = _normalize_to_uint8(source)
+
+    curr_mask = np.abs(current_sparse) > threshold
+    prev_mask = np.abs(previous_sparse) > threshold
+    diff_mask = curr_mask ^ prev_mask
+
+    # 使用mask减图的非零区域做门控，仅保留原图对应像素。
+    masked = np.zeros_like(base, dtype=np.uint8)
+    masked[diff_mask] = base[diff_mask]
+    return _gray_to_qimage(masked)
+
+
 def _sanitize_frame(data: np.ndarray) -> np.ndarray:
     frame = np.array(data, dtype=np.float32, copy=True)
     finite = np.isfinite(frame)
@@ -451,8 +466,10 @@ class MainWindow(QMainWindow):
         self._images = []
         self._rpca_annotated = []
         self._rpca_mask_diff = []
+        self._rpca_mask_diff_multiplied = []
         self._is_rpca_view = False
         self._rpca_show_mask_diff = False
+        self._rpca_show_mask_diff_multiplied = False
         self._annotation_mode_label = ""
         self._rpca_sparse = None
         self._rpca_abs = None
@@ -475,6 +492,8 @@ class MainWindow(QMainWindow):
         fixed_bg_rpca_btn.clicked.connect(self._run_fixed_background_rpca)
         self.rpca_view_toggle_btn = QPushButton("显示: 原始红绿mask")
         self.rpca_view_toggle_btn.clicked.connect(self._toggle_rpca_view_mode)
+        self.rpca_mask_mul_btn = QPushButton("显示: mask减图×原图")
+        self.rpca_mask_mul_btn.clicked.connect(self._toggle_rpca_mask_mul_view)
         point_change_btn = QPushButton("点源对齐检测")
         point_change_btn.clicked.connect(self._run_point_source_change_detection)
         self.auto_threshold_checkbox = QCheckBox("自动阈值")
@@ -499,6 +518,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(rpca_btn, 0)
         left_layout.addWidget(fixed_bg_rpca_btn, 0)
         left_layout.addWidget(self.rpca_view_toggle_btn, 0)
+        left_layout.addWidget(self.rpca_mask_mul_btn, 0)
         left_layout.addWidget(point_change_btn, 0)
         left_layout.addWidget(self.auto_threshold_checkbox, 0)
         left_layout.addWidget(self.threshold_hint_label, 0)
@@ -573,7 +593,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先执行 RPCA 标注后再切换显示模式")
             return
         self._rpca_show_mask_diff = not self._rpca_show_mask_diff
+        self._rpca_show_mask_diff_multiplied = False
         self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
         if self._is_rpca_view:
             current = self.list_widget.currentRow()
             if current >= 0:
@@ -582,6 +604,24 @@ class MainWindow(QMainWindow):
     def _update_rpca_view_toggle_text(self):
         text = "显示: mask减图(当前-前一帧)" if self._rpca_show_mask_diff else "显示: 原始红绿mask"
         self.rpca_view_toggle_btn.setText(text)
+
+    def _toggle_rpca_mask_mul_view(self):
+        if self._rpca_sparse is None:
+            QMessageBox.information(self, "提示", "请先执行 RPCA 标注后再切换显示模式")
+            return
+        self._rpca_show_mask_diff_multiplied = not self._rpca_show_mask_diff_multiplied
+        if self._rpca_show_mask_diff_multiplied:
+            self._rpca_show_mask_diff = False
+        self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
+        if self._is_rpca_view:
+            current = self.list_widget.currentRow()
+            if current >= 0:
+                self._on_current_row_changed(current)
+
+    def _update_rpca_mask_mul_btn_text(self):
+        text = "显示: 原始红绿mask" if self._rpca_show_mask_diff_multiplied else "显示: mask减图×原图"
+        self.rpca_mask_mul_btn.setText(text)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -623,13 +663,16 @@ class MainWindow(QMainWindow):
         self._images.clear()
         self._rpca_annotated.clear()
         self._rpca_mask_diff.clear()
+        self._rpca_mask_diff_multiplied.clear()
         self._is_rpca_view = False
         self._rpca_show_mask_diff = False
+        self._rpca_show_mask_diff_multiplied = False
         self._annotation_mode_label = ""
         self._rpca_sparse = None
         self._rpca_abs = None
         self._rpca_threshold = None
         self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
 
         failed = []
         for path in fits_files:
@@ -663,7 +706,9 @@ class MainWindow(QMainWindow):
 
         _, qimg, _ = self._images[row]
         if self._is_rpca_view and row < len(self._rpca_annotated):
-            if self._rpca_show_mask_diff and row < len(self._rpca_mask_diff):
+            if self._rpca_show_mask_diff_multiplied and row < len(self._rpca_mask_diff_multiplied):
+                self.view.set_image(self._rpca_mask_diff_multiplied[row])
+            elif self._rpca_show_mask_diff and row < len(self._rpca_mask_diff):
                 self.view.set_image(self._rpca_mask_diff[row])
             else:
                 self.view.set_image(self._rpca_annotated[row])
@@ -730,7 +775,9 @@ class MainWindow(QMainWindow):
         self._is_rpca_view = True
         self._annotation_mode_label = "RPCA标注"
         self._rpca_show_mask_diff = False
+        self._rpca_show_mask_diff_multiplied = False
         self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
         current = self.list_widget.currentRow()
         if current >= 0:
             self._on_current_row_changed(current)
@@ -790,7 +837,9 @@ class MainWindow(QMainWindow):
         self._is_rpca_view = True
         self._annotation_mode_label = f"固定背景RPCA(参考: {ref_name})"
         self._rpca_show_mask_diff = False
+        self._rpca_show_mask_diff_multiplied = False
         self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
         current = self.list_widget.currentRow()
         if current >= 0:
             self._on_current_row_changed(current)
@@ -875,8 +924,11 @@ class MainWindow(QMainWindow):
         self._rpca_threshold = None
         self._rpca_annotated = annotated_images
         self._rpca_mask_diff = []
+        self._rpca_mask_diff_multiplied = []
         self._rpca_show_mask_diff = False
+        self._rpca_show_mask_diff_multiplied = False
         self._update_rpca_view_toggle_text()
+        self._update_rpca_mask_mul_btn_text()
         self._is_rpca_view = True
         ref_name = self._images[ref_idx][0].name
         self._annotation_mode_label = f"点源对齐检测(参考: {ref_name})"
@@ -912,6 +964,7 @@ class MainWindow(QMainWindow):
         self._rpca_threshold = self._compute_current_threshold()
         self._rpca_annotated = []
         self._rpca_mask_diff = []
+        self._rpca_mask_diff_multiplied = []
         h, w = self._images[0][2].shape
         for idx, (_, _, data) in enumerate(self._images):
             sparse_i = self._rpca_sparse[:, idx].reshape(h, w)
@@ -925,6 +978,10 @@ class MainWindow(QMainWindow):
                 data, sparse_i, prev_sparse_i, self._rpca_threshold
             )
             self._rpca_mask_diff.append(mask_diff)
+            mask_diff_multiplied = build_mask_diff_multiplied_image(
+                data, sparse_i, prev_sparse_i, self._rpca_threshold
+            )
+            self._rpca_mask_diff_multiplied.append(mask_diff_multiplied)
 
     def _on_threshold_mode_changed(self):
         self._update_threshold_hint_label()
