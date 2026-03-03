@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -180,6 +182,9 @@ class MainWindow(QMainWindow):
         self._images = []
         self._rpca_annotated = []
         self._is_rpca_view = False
+        self._rpca_sparse = None
+        self._rpca_abs = None
+        self._rpca_threshold = None
 
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self._on_current_row_changed)
@@ -194,6 +199,14 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self._open_files_dialog)
         rpca_btn = QPushButton("RPCA标注")
         rpca_btn.clicked.connect(self._run_rpca_annotation)
+        self.auto_threshold_checkbox = QCheckBox("自动阈值")
+        self.auto_threshold_checkbox.setChecked(True)
+        self.auto_threshold_checkbox.toggled.connect(self._on_threshold_mode_changed)
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setRange(1, 100)
+        self.threshold_slider.setValue(45)
+        self.threshold_slider.valueChanged.connect(self._on_threshold_control_changed)
+        self.threshold_hint_label = QLabel("阈值灵敏度: 45 (自动)")
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -206,6 +219,9 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(open_btn, 0)
         left_layout.addWidget(rpca_btn, 0)
+        left_layout.addWidget(self.auto_threshold_checkbox, 0)
+        left_layout.addWidget(self.threshold_hint_label, 0)
+        left_layout.addWidget(self.threshold_slider, 0)
         left_layout.addWidget(self.list_widget, 1)
 
         splitter = QSplitter()
@@ -263,9 +279,12 @@ class MainWindow(QMainWindow):
         count = len(self._images)
         current = self.list_widget.currentRow() + 1 if count else 0
         view_mode = "RPCA标注" if self._is_rpca_view else "原图"
+        threshold_text = ""
+        if self._rpca_threshold is not None:
+            threshold_text = f"    阈值: {self._rpca_threshold:.4g}"
         self.info_label.setText(
             f"图像: {current}/{count}    缩放: {self._zoom * 100:.1f}%    "
-            f"模式: {view_mode}    快捷键: Tab/Shift+Tab 切换, Ctrl+加减号缩放"
+            f"模式: {view_mode}{threshold_text}    快捷键: Tab/Shift+Tab 切换, Ctrl+加减号缩放"
         )
 
     def dragEnterEvent(self, event):
@@ -308,6 +327,9 @@ class MainWindow(QMainWindow):
         self._images.clear()
         self._rpca_annotated.clear()
         self._is_rpca_view = False
+        self._rpca_sparse = None
+        self._rpca_abs = None
+        self._rpca_threshold = None
 
         failed = []
         for path in fits_files:
@@ -399,24 +421,66 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        sparse_abs = np.abs(sparse)
-        med = float(np.median(sparse_abs))
-        mad = float(np.median(np.abs(sparse_abs - med)))
-        threshold = med + 4.5 * (mad + 1e-8)
-        if threshold <= 0:
-            threshold = float(np.percentile(sparse_abs, 95))
-
-        self._rpca_annotated = []
-        for idx, (_, _, data) in enumerate(self._images):
-            sparse_i = sparse[:, idx].reshape(h, w)
-            annotated = build_annotation_image(data, sparse_i, threshold)
-            self._rpca_annotated.append(annotated)
+        self._rpca_sparse = sparse
+        self._rpca_abs = np.abs(sparse)
+        self._rebuild_rpca_annotations()
 
         self._is_rpca_view = True
         current = self.list_widget.currentRow()
         if current >= 0:
             self._on_current_row_changed(current)
         QMessageBox.information(self, "完成", "RPCA 标注已完成：红色为变化区域，绿色增强为背景区域")
+
+    def _compute_current_threshold(self) -> float:
+        if self._rpca_abs is None:
+            return 0.0
+        sensitivity = self.threshold_slider.value() / 100.0
+        if self.auto_threshold_checkbox.isChecked():
+            med = float(np.median(self._rpca_abs))
+            mad = float(np.median(np.abs(self._rpca_abs - med)))
+            # 灵敏度越高，阈值越低，标出的变化区域越多。
+            k = 8.0 - 7.5 * sensitivity
+            threshold = med + k * (mad + 1e-8)
+        else:
+            max_val = float(np.max(self._rpca_abs))
+            threshold = max_val * (1.0 - sensitivity)
+        if threshold <= 0:
+            threshold = float(np.percentile(self._rpca_abs, 95))
+        return threshold
+
+    def _rebuild_rpca_annotations(self):
+        if self._rpca_sparse is None:
+            return
+        self._rpca_threshold = self._compute_current_threshold()
+        self._rpca_annotated = []
+        h, w = self._images[0][2].shape
+        self._rpca_annotated = []
+        for idx, (_, _, data) in enumerate(self._images):
+            sparse_i = self._rpca_sparse[:, idx].reshape(h, w)
+            annotated = build_annotation_image(data, sparse_i, self._rpca_threshold)
+            self._rpca_annotated.append(annotated)
+
+    def _on_threshold_mode_changed(self):
+        self._update_threshold_hint_label()
+        self._on_threshold_control_changed()
+
+    def _on_threshold_control_changed(self):
+        self._update_threshold_hint_label()
+        if self._rpca_sparse is None:
+            self._refresh_info_label()
+            return
+        self._rebuild_rpca_annotations()
+        if self._is_rpca_view:
+            current = self.list_widget.currentRow()
+            if current >= 0:
+                self._on_current_row_changed(current)
+        else:
+            self._refresh_info_label()
+
+    def _update_threshold_hint_label(self):
+        value = self.threshold_slider.value()
+        mode = "自动" if self.auto_threshold_checkbox.isChecked() else "手动"
+        self.threshold_hint_label.setText(f"阈值灵敏度: {value} ({mode})")
 
 
 def main():
