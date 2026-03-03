@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QAction, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -152,9 +152,29 @@ class ImageView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
 
     def set_image(self, image: QImage) -> None:
+        old_rect = self.sceneRect()
+        old_center = self.mapToScene(self.viewport().rect().center())
+        keep_relative_center = old_rect.isValid() and old_rect.width() > 0 and old_rect.height() > 0
+        rel_x = 0.5
+        rel_y = 0.5
+        if keep_relative_center:
+            rel_x = (old_center.x() - old_rect.left()) / old_rect.width()
+            rel_y = (old_center.y() - old_rect.top()) / old_rect.height()
+
         self._pixmap_item.setPixmap(QPixmap.fromImage(image))
-        self.scene().setSceneRect(self._pixmap_item.boundingRect())
+        new_rect = self._pixmap_item.boundingRect()
+        self.scene().setSceneRect(new_rect)
         self.set_zoom(self._zoom)
+        if keep_relative_center and new_rect.width() > 0 and new_rect.height() > 0:
+            rel_x = min(max(rel_x, 0.0), 1.0)
+            rel_y = min(max(rel_y, 0.0), 1.0)
+            target = QPointF(
+                new_rect.left() + rel_x * new_rect.width(),
+                new_rect.top() + rel_y * new_rect.height(),
+            )
+            self.centerOn(target)
+        else:
+            self.centerOn(new_rect.center())
 
     def set_zoom(self, value: float) -> None:
         self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, value))
@@ -368,7 +388,6 @@ class MainWindow(QMainWindow):
             self.view.set_image(qimg)
             self._is_rpca_view = False
 
-        self.view.set_zoom(self._zoom)
         self._refresh_info_label()
 
     def _next_image(self):
