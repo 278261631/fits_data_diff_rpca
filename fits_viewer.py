@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -220,6 +221,78 @@ def gaussian_blur(data: np.ndarray, sigma: float = 1.2) -> np.ndarray:
     for i, w in enumerate(kernel):
         blur_xy += padded_y[i : i + frame.shape[0], :] * w
     return blur_xy
+
+
+def _binary_dilate_once(mask: np.ndarray) -> np.ndarray:
+    m = mask.astype(bool, copy=False)
+    p = np.pad(m, ((1, 1), (1, 1)), mode="constant", constant_values=False)
+    out = np.zeros_like(m, dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            out |= p[dy : dy + m.shape[0], dx : dx + m.shape[1]]
+    return out
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components = []
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            pixels = []
+            while stack:
+                cy, cx = stack.pop()
+                pixels.append((cy, cx))
+                for ny in range(max(0, cy - 1), min(h, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(w, cx + 2)):
+                        if mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            components.append(np.array(pixels, dtype=np.int32))
+    return components
+
+
+def expand_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    src = mask.astype(bool)
+    if min_area <= 1 or not src.any():
+        return src
+    out = src.copy()
+    for comp in _connected_components(src):
+        if len(comp) >= min_area:
+            continue
+        grown = np.zeros_like(src, dtype=bool)
+        grown[comp[:, 0], comp[:, 1]] = True
+        while int(np.count_nonzero(grown)) < min_area:
+            dilated = _binary_dilate_once(grown)
+            if np.array_equal(dilated, grown):
+                break
+            grown = dilated
+        out |= grown
+    return out
+
+
+def compute_threshold_from_abs(
+    rpca_abs: np.ndarray, sensitivity: float, auto_mode: bool
+) -> float:
+    if rpca_abs.size == 0:
+        return 0.0
+    sensitivity = float(np.clip(sensitivity, 0.01, 1.0))
+    if auto_mode:
+        med = float(np.median(rpca_abs))
+        mad = float(np.median(np.abs(rpca_abs - med)))
+        # 灵敏度越高，阈值越低，标出的变化区域越多。
+        k = 8.0 - 7.5 * sensitivity
+        threshold = med + k * (mad + 1e-8)
+    else:
+        max_val = float(np.max(rpca_abs))
+        threshold = max_val * (1.0 - sensitivity)
+    if threshold <= 0:
+        threshold = float(np.percentile(rpca_abs, 95))
+    return threshold
 
 
 def detect_point_sources(data: np.ndarray, sensitivity: float) -> np.ndarray:
@@ -537,6 +610,8 @@ class MainWindow(QMainWindow):
         self.rpca_mask_mul_btn.clicked.connect(self._toggle_rpca_mask_mul_view)
         self.rpca_mask_mul_save_btn = QPushButton("保存: mask减图×原图")
         self.rpca_mask_mul_save_btn.clicked.connect(self._save_mask_diff_multiplied_images)
+        self.rpca_binary_save_btn = QPushButton("保存: RPCA二值mask(FITS)")
+        self.rpca_binary_save_btn.clicked.connect(self._save_rpca_binary_mask_fits)
         point_change_btn = QPushButton("点源对齐检测")
         point_change_btn.clicked.connect(self._run_point_source_change_detection)
         self.auto_threshold_checkbox = QCheckBox("自动阈值")
@@ -547,6 +622,12 @@ class MainWindow(QMainWindow):
         self.threshold_slider.setValue(45)
         self.threshold_slider.valueChanged.connect(self._on_threshold_control_changed)
         self.threshold_hint_label = QLabel("阈值灵敏度: 45 (自动)")
+        self.min_area_spinbox = QSpinBox()
+        self.min_area_spinbox.setRange(1, 999999)
+        self.min_area_spinbox.setValue(5)
+        self.min_area_spinbox.setPrefix("小区域膨胀目标面积: ")
+        self.min_area_spinbox.setSuffix(" px")
+        self.min_area_spinbox.setToolTip("导出额外mask时，连通域面积不足该值会迭代膨胀到该面积")
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -565,10 +646,12 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.rpca_view_toggle_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_save_btn, 0)
+        left_layout.addWidget(self.rpca_binary_save_btn, 0)
         left_layout.addWidget(point_change_btn, 0)
         left_layout.addWidget(self.auto_threshold_checkbox, 0)
         left_layout.addWidget(self.threshold_hint_label, 0)
         left_layout.addWidget(self.threshold_slider, 0)
+        left_layout.addWidget(self.min_area_spinbox, 0)
         left_layout.addWidget(self.list_widget, 1)
 
         splitter = QSplitter()
@@ -734,6 +817,120 @@ class MainWindow(QMainWindow):
             )
             return
 
+        QMessageBox.critical(self, "保存失败", "未成功保存任何文件。\n" + "\n".join(failed[:12]))
+
+    def _save_rpca_binary_mask_fits(self):
+        if self._rpca_sparse is None or self._rpca_threshold is None:
+            QMessageBox.information(self, "提示", "请先执行 RPCA 标注后再导出二值化 FITS")
+            return
+        if not self._images:
+            QMessageBox.information(self, "提示", "当前没有可导出的图像")
+            return
+
+        h, w = self._images[0][2].shape
+        min_area = int(self.min_area_spinbox.value())
+        sensitivity = self.threshold_slider.value() / 100.0
+        auto_mode = self.auto_threshold_checkbox.isChecked()
+        date_tag = datetime.now().strftime("%Y%m%d")
+        out_dir_name = f"rpca_binary_{date_tag}"
+        saved_files = []
+        failed = []
+        expanded_masks = []
+        smoothed_masks = []
+
+        for idx, (path, _, _) in enumerate(self._images):
+            out_dir = path.parent / out_dir_name
+            out_path = out_dir / f"{path.stem}_rpca_bin_mask.fits"
+            out_expand_path = out_dir / f"{path.stem}_rpca_bin_mask_expand_min{min_area}.fits"
+            out_expand_smooth_path = out_dir / f"{path.stem}_rpca_bin_mask_expand_min{min_area}_gauss.fits"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                sparse_i = self._rpca_sparse[:, idx].reshape(h, w)
+                binary_mask = (np.abs(sparse_i) > self._rpca_threshold).astype(np.uint8)
+                fits.writeto(out_path, binary_mask, overwrite=True)
+                expanded_mask = expand_small_components(binary_mask, min_area=min_area).astype(np.uint8)
+                fits.writeto(out_expand_path, expanded_mask, overwrite=True)
+                smooth_mask = gaussian_blur(expanded_mask.astype(np.float32), sigma=1.2)
+                fits.writeto(out_expand_smooth_path, smooth_mask.astype(np.float32), overwrite=True)
+                saved_files.append(out_path)
+                saved_files.append(out_expand_path)
+                saved_files.append(out_expand_smooth_path)
+                expanded_masks.append(expanded_mask.astype(np.float32))
+                smoothed_masks.append(smooth_mask.astype(np.float32))
+            except Exception as exc:
+                failed.append(f"{path.name}: {exc}")
+
+        if len(smoothed_masks) == len(self._images) and len(smoothed_masks) >= 2:
+            try:
+                smooth_matrix = np.stack([x.reshape(-1) for x in smoothed_masks], axis=1)
+                _, smooth_sparse = rpca_decompose(smooth_matrix)
+                smooth_abs = np.abs(smooth_sparse)
+                smooth_threshold = compute_threshold_from_abs(
+                    smooth_abs, sensitivity=sensitivity, auto_mode=auto_mode
+                )
+                for idx, (path, _, _) in enumerate(self._images):
+                    out_dir = path.parent / out_dir_name
+                    out_smooth_rpca_mask = (
+                        out_dir / f"{path.stem}_rpca_bin_mask_expand_min{min_area}_gauss_rpca_mask.fits"
+                    )
+                    out_smooth_rpca_rb = (
+                        out_dir / f"{path.stem}_rpca_bin_mask_expand_min{min_area}_gauss_rpca_diff_rb.png"
+                    )
+                    out_smooth_rpca_diff = (
+                        out_dir / f"{path.stem}_rpca_bin_mask_expand_min{min_area}_gauss_diff_by_rpca_mask.fits"
+                    )
+
+                    sparse_i = smooth_sparse[:, idx].reshape(h, w)
+                    curr_mask = np.abs(sparse_i) > smooth_threshold
+                    if idx == 0:
+                        prev_mask = np.zeros_like(curr_mask)
+                        smooth_diff = np.zeros((h, w), dtype=np.float32)
+                    else:
+                        prev_sparse_i = smooth_sparse[:, idx - 1].reshape(h, w)
+                        prev_mask = np.abs(prev_sparse_i) > smooth_threshold
+                        smooth_diff = smoothed_masks[idx] - smoothed_masks[idx - 1]
+
+                    mask_diff_data = curr_mask.astype(np.float32) - prev_mask.astype(np.float32)
+                    diff_gate = mask_diff_data != 0
+                    smooth_diff_masked = smooth_diff * diff_gate.astype(np.float32)
+
+                    try:
+                        fits.writeto(out_smooth_rpca_mask, curr_mask.astype(np.uint8), overwrite=True)
+                        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+                        added = mask_diff_data > 0
+                        removed = mask_diff_data < 0
+                        rgb[added, 0] = 255
+                        rgb[removed, 2] = 255
+                        _rgb_to_qimage(rgb).save(str(out_smooth_rpca_rb), "PNG")
+                        fits.writeto(out_smooth_rpca_diff, smooth_diff_masked.astype(np.float32), overwrite=True)
+                        saved_files.append(out_smooth_rpca_mask)
+                        saved_files.append(out_smooth_rpca_rb)
+                        saved_files.append(out_smooth_rpca_diff)
+                    except Exception as exc:
+                        failed.append(f"{path.name} (平滑RPCA输出): {exc}")
+            except Exception as exc:
+                failed.append(f"平滑输出RPCA失败: {exc}")
+        elif len(smoothed_masks) == 1:
+            failed.append("仅有 1 张平滑输出，无法执行平滑输出RPCA流程")
+
+        if saved_files and not failed:
+            QMessageBox.information(
+                self,
+                "保存完成",
+                (
+                    f"已保存 {len(saved_files)} 个文件到各自目录下的 {out_dir_name} 文件夹。\n"
+                    "包含: 原始二值mask、膨胀mask、高斯平滑mask、平滑后RPCA新mask、"
+                    "新mask红蓝差分图、基于新mask的平滑减图。"
+                ),
+            )
+            return
+        if saved_files and failed:
+            QMessageBox.warning(
+                self,
+                "部分保存失败",
+                f"成功保存 {len(saved_files)} 个文件。\n失败 {len(failed)} 个：\n" + "\n".join(failed[:12]),
+            )
+            return
         QMessageBox.critical(self, "保存失败", "未成功保存任何文件。\n" + "\n".join(failed[:12]))
 
     def _find_hotpants_executable(self) -> str | None:
@@ -1208,18 +1405,11 @@ class MainWindow(QMainWindow):
         if self._rpca_abs is None:
             return 0.0
         sensitivity = self.threshold_slider.value() / 100.0
-        if self.auto_threshold_checkbox.isChecked():
-            med = float(np.median(self._rpca_abs))
-            mad = float(np.median(np.abs(self._rpca_abs - med)))
-            # 灵敏度越高，阈值越低，标出的变化区域越多。
-            k = 8.0 - 7.5 * sensitivity
-            threshold = med + k * (mad + 1e-8)
-        else:
-            max_val = float(np.max(self._rpca_abs))
-            threshold = max_val * (1.0 - sensitivity)
-        if threshold <= 0:
-            threshold = float(np.percentile(self._rpca_abs, 95))
-        return threshold
+        return compute_threshold_from_abs(
+            self._rpca_abs,
+            sensitivity=sensitivity,
+            auto_mode=self.auto_threshold_checkbox.isChecked(),
+        )
 
     def _rebuild_rpca_annotations(self):
         if self._rpca_sparse is None:
