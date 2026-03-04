@@ -34,6 +34,7 @@ FITS_SUFFIXES = {".fits", ".fit", ".fts"}
 MIN_ZOOM = 0.05
 MAX_ZOOM = 30.0
 ZOOM_STEP = 1.15
+DEFAULT_HOTPANTS_PATH = Path(r"D:\github\win_hotpants\build\Release\hotpants.exe")
 
 
 def _read_fits_2d(file_path: Path) -> np.ndarray:
@@ -189,6 +190,36 @@ def _sanitize_frame(data: np.ndarray) -> np.ndarray:
     else:
         frame.fill(0.0)
     return frame
+
+
+def _gaussian_kernel_1d(sigma: float, radius: int | None = None) -> np.ndarray:
+    if sigma <= 0:
+        return np.array([1.0], dtype=np.float32)
+    if radius is None:
+        radius = max(1, int(round(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(x * x) / (2.0 * sigma * sigma))
+    kernel_sum = float(np.sum(kernel))
+    if kernel_sum <= 0:
+        return np.array([1.0], dtype=np.float32)
+    return (kernel / kernel_sum).astype(np.float32)
+
+
+def gaussian_blur(data: np.ndarray, sigma: float = 1.2) -> np.ndarray:
+    frame = _sanitize_frame(data)
+    kernel = _gaussian_kernel_1d(sigma=sigma)
+    radius = len(kernel) // 2
+
+    padded_x = np.pad(frame, ((0, 0), (radius, radius)), mode="edge")
+    blur_x = np.zeros_like(frame, dtype=np.float32)
+    for i, w in enumerate(kernel):
+        blur_x += padded_x[:, i : i + frame.shape[1]] * w
+
+    padded_y = np.pad(blur_x, ((radius, radius), (0, 0)), mode="edge")
+    blur_xy = np.zeros_like(frame, dtype=np.float32)
+    for i, w in enumerate(kernel):
+        blur_xy += padded_y[i : i + frame.shape[0], :] * w
+    return blur_xy
 
 
 def detect_point_sources(data: np.ndarray, sensitivity: float) -> np.ndarray:
@@ -478,6 +509,8 @@ class MainWindow(QMainWindow):
         self._rpca_abs = None
         self._rpca_threshold = None
         self._hotpants_tempdir = None
+        self._smoothed_row = -1
+        self._smoothed_image = None
 
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self._on_current_row_changed)
@@ -496,6 +529,8 @@ class MainWindow(QMainWindow):
         fixed_bg_rpca_btn.clicked.connect(self._run_fixed_background_rpca)
         hotpants_btn = QPushButton("Hotpants减图")
         hotpants_btn.clicked.connect(self._run_hotpants_subtraction)
+        gaussian_btn = QPushButton("高斯平滑(当前图像)")
+        gaussian_btn.clicked.connect(self._apply_gaussian_smoothing_current)
         self.rpca_view_toggle_btn = QPushButton("显示: 原始红绿mask")
         self.rpca_view_toggle_btn.clicked.connect(self._toggle_rpca_view_mode)
         self.rpca_mask_mul_btn = QPushButton("显示: mask减图×原图")
@@ -526,6 +561,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(rpca_btn, 0)
         left_layout.addWidget(fixed_bg_rpca_btn, 0)
         left_layout.addWidget(hotpants_btn, 0)
+        left_layout.addWidget(gaussian_btn, 0)
         left_layout.addWidget(self.rpca_view_toggle_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_btn, 0)
         left_layout.addWidget(self.rpca_mask_mul_save_btn, 0)
@@ -701,7 +737,11 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "保存失败", "未成功保存任何文件。\n" + "\n".join(failed[:12]))
 
     def _find_hotpants_executable(self) -> str | None:
-        # 允许通过环境变量显式指定可执行文件路径。
+        # 默认优先使用本机已验证可用的 hotpants 路径。
+        if DEFAULT_HOTPANTS_PATH.exists():
+            return str(DEFAULT_HOTPANTS_PATH)
+
+        # 其次允许通过环境变量显式指定可执行文件路径。
         from os import environ
 
         custom = environ.get("HOTPANTS_PATH", "").strip()
@@ -816,6 +856,25 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "完成", "Hotpants 减图完成（当前帧 - 前一帧）")
 
+    def _clear_smoothed_view(self):
+        self._smoothed_row = -1
+        self._smoothed_image = None
+
+    def _apply_gaussian_smoothing_current(self):
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= len(self._images):
+            QMessageBox.information(self, "提示", "请先选中一张图像")
+            return
+        _, _, data = self._images[row]
+        smooth_data = gaussian_blur(data, sigma=1.2)
+        smooth_qimg = _gray_to_qimage(_normalize_to_uint8(smooth_data))
+        self._smoothed_row = row
+        self._smoothed_image = smooth_qimg
+        self._is_rpca_view = False
+        self._annotation_mode_label = "高斯平滑"
+        self.view.set_image(smooth_qimg)
+        self._refresh_info_label()
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -832,6 +891,7 @@ class MainWindow(QMainWindow):
 
     def load_files(self, paths):
         self._cleanup_hotpants_tempdir()
+        self._clear_smoothed_view()
         fits_files = []
         for p in paths:
             if p.is_file() and p.suffix.lower() in FITS_SUFFIXES:
@@ -901,6 +961,12 @@ class MainWindow(QMainWindow):
             return
 
         _, qimg, _ = self._images[row]
+        if self._smoothed_image is not None and row == self._smoothed_row:
+            self.view.set_image(self._smoothed_image)
+            self._is_rpca_view = False
+            self._annotation_mode_label = "高斯平滑"
+            self._refresh_info_label()
+            return
         if self._is_rpca_view and row < len(self._rpca_annotated):
             if self._rpca_show_mask_diff_multiplied and row < len(self._rpca_mask_diff_multiplied):
                 self.view.set_image(self._rpca_mask_diff_multiplied[row])
